@@ -13,7 +13,7 @@
 (defun relu (x)
   (if (> x 0.0) x 0.0))
 
-(defun d-relu (x)
+(defun d-relu (x &rest other)
   (if (> x 0.0) 1.0 0.0))
 
 (defun default-d-loss (target output &rest other)
