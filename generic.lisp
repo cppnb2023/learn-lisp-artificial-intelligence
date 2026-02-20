@@ -105,17 +105,98 @@
       (loop for i from 0 below len do
 	    (setf (aref res i) (/ (aref res i) sum))))))
 
-(defmacro vector-do-map (dst (&rest bindings) &body body)
-  (let ((i-sym (gensym "i")))
-    `(loop for ,i-sym from 0 below (length ,dst)
-	   ,@(loop for (bind prep vec) in bindings append
-		   `(for ,bind ,prep ,vec))
-	   do
-	   (setf (aref ,dst ,i-sym)
-		 (progn
-		   ,@body))
-	   finally
-	   (return ,dst))))
+(defun singlep (lst)
+  (and (consp lst) (null (cdr lst))))
+
+(defmacro vector-do-map ((key dst &rest others) (&rest bindings) &body body)
+  (flet ((parse (binding idx-sym)
+	   (ecase (first binding)
+	     (:norm
+	      (assert (= (length binding) 3) ()
+		      "for :NORM BINDING need 3 arguments~% but have ~a"
+		      (length binding))
+	      `(for ,(second binding) = (aref ,(third binding) ,idx-sym)))
+	     (:row
+	      (assert (= (length binding) 4) ()
+		      "for :ROW BINDING need 4 arguments~% but have ~a"
+		      (length binding))
+	      `(for ,(second binding) =
+		(aref ,(third binding) ,(fourth binding) ,idx-sym)))
+	     (:col
+	      (assert (= (length binding) 4) ()
+		      "for :COL BINDING need 4 arguments~% but have ~a"
+		      (length binding))
+	      `(for ,(second binding) =
+		    (aref ,(third binding) ,idx-sym ,(fourth binding))))
+	     (:list
+	      (assert (<= 3 (length binding) 4) ()
+		      "for :LIST BINDING need 3 or 4 arguments~% but have ~a"
+		      (length binding))
+	      `(for ,(second binding) in ,(third binding)
+		    by ,(if (fourth binding) (fourth binding) #'cdr))))))
+    (assert (symbolp key) ()
+	    "KEY must be symbol")
+    (let ((dst-sym (gensym "dst")))
+      `(let ((,dst-sym ,dst))
+	 (assert (arrayp ,dst-sym) ()
+		 "dst must be array or vector:~%~a" ,dst-sym)
+	 (loop for i from 0 below
+	       ,(ecase key
+		  (:norm
+		   `(length ,dst-sym))
+		  (:row
+		   `(array-dimension ,dst-sym 1))
+		  (:col
+		   `(array-dimension ,dst-sym 0)))
+	       ,@(loop for binding in bindings append
+		       (parse binding 'i))
+	       do
+	       (setf ,(ecase key
+			(:norm
+			 (assert (null others) ()
+				 "for :NORM OTHERS must be NIL")
+			 `(aref ,dst-sym i))
+			(:row
+			 (assert (singlep others) ()
+				 "for :ROW OTHERS only have one element")
+			 `(aref ,dst-sym ,(car others) i))
+			(:col
+			 (assert (singlep others) ()
+				 "for :COL OTHERS only have one element")
+			 `(aref ,dst-sym i ,(car others))))
+		     (progn
+		       ,@body))
+	       finally
+	       (return ,dst-sym))))))
+
+(defun make-dimension-accessor
+    (array dimension &optional writep)
+  (assert (arrayp array) ()
+	  "~a not is array" array)
+  (assert (integerp dimension) ()
+	  "~a not is integer" dimension)
+  (when (minusp dimension)
+    (setf dimension (+ (array-rank array)
+		       dimension)))
+  (let* ((rank (array-rank array))
+	 (total-len
+	  (apply #'* (array-dimensions array)))
+	 (step
+	  (apply #'* (nthcdr (1+ dimension)
+			     (array-dimensions array))))
+	 (remap
+	  (make-array total-len
+		      :displaced-to array
+		      :displaced-index-offset 0)))
+    (declare (type fixnum total-len))
+    (declare (type fixnum step))
+    (declare (type fixnum rank))
+    (setf step (if (zerop step) 1 step))
+    (if writep
+	(lambda (idx new-val)
+	  (setf (aref remap (* idx step)) new-val))
+	(lambda (idx)
+	  (aref remap (* idx step))))))
 
 (defmacro with-vector ((&rest bindings) &body body)
   (let ((result-sym (gensym "result")))
@@ -127,32 +208,53 @@
        ,@(loop for (sym len) in bindings collect
 	       `(declare (type (simple-array single-float
 					     ,@(when (numberp len)
-						  `((,len))))
+						 `((,len))))
 			       ,sym)))
-	 (macrolet ((,(intern "V+") (res &body body)
-		      `(vector-add-into ,res ,@body))
-		    (,(intern "V*") (&body body)
-		      `(vector-dot-mul ,@body))
-		    (,(intern "V-") (res &body body)
-		      `(vector-sub-into ,res ,@body))
-		    (,(intern "VSCALE") (res num vec)
-		      `(vector-num-mul-into ,res ,num ,vec))
-		    (,(intern "VCOPY") (vec1 vec2)
-		      `(vector-copy ,vec1 ,vec2))
-		    (,(intern "VAPPLY") (res vec func)
-		      `(vector-apply ,res ,vec ,func))
-		    (,(intern "VMAP") (res func &body vecs)
-		      `(vector-map-into ,res ,func ,@vecs))
-		    (,(intern "VSET") (vec num)
-		      `(vector-elements-set ,vec ,num))
-		    (,(intern "MAKE-VECTOR") (len)
-		      `(make-array ,len
-				     :element-type 'single-float
-				     :initial-element 0.0))
-		    (,(intern "SOFTMAX") (res vec &optional (temperature 1.0))
-		      `(vector-softmax-into ,res ,vec
-					    :temperature ,temperature))
-		    (,(intern "DOMAP") (dst (&rest bindings) &body body)
-		      `(vector-do-map ,dst ,bindings ,@body)))
-	   ,@body))))
-
+       (flet ((,(intern "SET-RESULT") (new-res)
+		(setf ,result-sym new-res))
+	      (,(intern "READ-RESULT") () ,result-sym))
+	 (macrolet
+	     ((,(intern "V+!") (res &body body)
+		`(vector-add-into ,res ,@body))
+	      (,(intern "V*") (&body body)
+		`(vector-dot-mul ,@body))
+	      (,(intern "V-!") (res &body body)
+		`(vector-sub-into ,res ,@body))
+	      (,(intern "VSCALE!") (res num vec)
+		`(vector-num-mul-into ,res ,num ,vec))
+	      (,(intern "VCOPY!") (vec1 vec2)
+		`(vector-copy ,vec1 ,vec2))
+	      (,(intern "VAPPLY!") (res vec func)
+		`(vector-apply ,res ,vec ,func))
+	      (,(intern "VMAP!") (res func &body vecs)
+		`(vector-map-into ,res ,func ,@vecs))
+	      (,(intern "VSET!") (vec num)
+		`(vector-elements-set ,vec ,num))
+	      (,(intern "V+") (&body body)
+		`(vector-add-into ,',result-sym ,@body))
+	      (,(intern "V-") (&body body)
+		`(vector-sub-into ,',result-sym ,@body))
+	      (,(intern "VSCALE") (num vec)
+		`(vector-num-mul-into ,',result-sym ,num ,vec))
+	      (,(intern "VCOPY") (vec2)
+		`(vector-copy ,',result-sym ,vec2))
+	      (,(intern "VAPPLY") (vec func)
+		`(vector-apply ,',result-sym ,vec ,func))
+	      (,(intern "VMAP") (func &body vecs)
+		`(vector-map-into ,',result-sym ,func ,@vecs))
+	      (,(intern "VSET") (num)
+		`(vector-elements-set ,',result-sym ,num))
+	      (,(intern "MAKE-VECTOR") (len)
+		`(make-array ,len
+			     :element-type 'single-float
+			     :initial-element 0.0))
+	      (,(intern "SOFTMAX") (res vec
+					&optional (temperature 1.0))
+		`(vector-softmax-into ,res ,vec
+				      :temperature ,temperature))
+	      (,(intern "DOMAP") (&body body)
+		`(vector-do-map ,@body))
+	      (,(intern "PROJECT") (array dimension
+					  &optional writep)
+		`(make-dimension-accessor array dimension writep)))
+	      ,@body)))))

@@ -57,19 +57,20 @@
 (defmethod recall ((network hopfield) input &optional output)
   (with-slots (patterns weight) network
     (with-vector ((temp (length input)))
+      (set-result temp)
       (softmax weight
-	       (domap weight ((pat in patterns))
-		      (v* (slot-value pat 'vector) input)))
+	       (domap (:norm weight) ((:list pat patterns))
+		      (v* input (slot-value pat 'vector))))
       (loop for pat in patterns
 	    for w across weight
 	    with output =
 	    (if output
-		(vset output 0)
+		(vset! output 0)
 		(make-vector (length input)))
 	    do
-	    (v+ output
-		output
-		(vscale temp w (slot-value pat 'vector)))
+	    (v+! output
+		 output
+		 (vscale w (slot-value pat 'vector)))
 	    finally
 	    (return-from recall
 	      (values
